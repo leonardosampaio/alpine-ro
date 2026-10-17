@@ -1,0 +1,14 @@
+# Saidas do build (ISOs oficial e gerado ficam aqui)
+out/
+*.iso
+*.sha256
+
+# Chaves SSH: a publica e embutida no ISO, cada um usa a sua; privada nunca
+iso-src/payload/authorized_keys
+*.key
+vmkey*
+
+# Testes locais em VM
+*.vdi
+*.vmdk
+*.log

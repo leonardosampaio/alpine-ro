@@ -1,0 +1,226 @@
+#!/bin/sh
+# roctl - Alpine somente leitura + Docker (camadas ro na p3, estado em /dev/shm, volumes em ZFS)
+SRC=/mnt/docker-store DST=/dev/shm/docker POOL=/mnt/zfs SHARE=/mnt/zfs/samba
+k=$SNAP_KEEP; [ -r /etc/rodocker.conf ] && . /etc/rodocker.conf   # SMBUSER/SMBPW/SNAP_KEEP da instalacao
+SNAP_KEEP=${k:-${SNAP_KEEP:-30}}                    # SNAP_KEEP=N roctl snap tem prioridade
+die() { echo "roctl: $*" >&2; exit 1; }
+apps() { [ ! -x /usr/local/sbin/roapp ] || /usr/local/sbin/roapp up; }   # o restart do Docker apagou os containers
+waitd() { for i in $(seq 60); do docker info >/dev/null 2>&1 && return; sleep 1; done; }
+ismnt() { awk -v p="$1" '$2==p {f=1} END {exit !f}' /proc/mounts; }   # o mountpoint do busybox nao ve bind no mesmo fs
+under() { awk -v p="$1" '$2==p || index($2, p "/")==1 {print $2}' /proc/mounts | sort -r; }
+# tetos de log em RAM (sem eles o padrao do Docker passaria de 1 GB):
+#  Docker  100 MiB = logs dos containers (driver local, <= 4 MiB cada, daemon.json) num tmpfs de 92 MiB + docker.log 2 x 4 MiB
+#  sistema 100 MiB = /dev/shm/log num tmpfs proprio: syslog 4 x 20 MiB (conf.d/syslog), docker.log, samba 2 x 1 MiB, dmesg
+CLOG_KB=$((92*1024)) SYSLOG_KB=$((100*1024))
+syslogfs() {  # /dev/shm/log num tmpfs proprio, preservando o que o boot ja gravou (dmesg)
+	L=/dev/shm/log T=/dev/shm/.log0
+	mountpoint -q $L && return
+	mkdir -p $L $T && cp -a $L/. $T/ 2>/dev/null
+	mount -t tmpfs -o size=${SYSLOG_KB}k,mode=0755,nosuid,nodev,noexec syslogs $L && cp -a $T/. $L/
+	rm -rf $T
+}
+logfs() { mountpoint -q $1 || { mkdir -p $1 && mount -t tmpfs -o size=${CLOG_KB}k,mode=0710 dockerlogs $1; }; }
+hasvol() { zfs list tank/docker-volumes >/dev/null 2>&1; }
+
+free_disks() {  # "setores nome" de discos inteiros livres (sem particoes/assinatura), exceto o do /
+	r=$(awk '$2=="/"{print $1}' /proc/mounts); r=${r#/dev/}
+	rd=$(basename "$(readlink -f /sys/class/block/$r/..)")
+	for s in /sys/block/*; do
+		n=${s##*/}
+		case $n in loop*|ram*|sr*|zram*|dm-*|md*|fd*) continue ;; esac
+		[ "$n" = "$rd" ] || [ "$(cat $s/removable)" != 0 ] || [ "$(cat $s/ro)" != 0 ] && continue
+		ls -d $s/$n?* >/dev/null 2>&1 && continue
+		[ -n "$(blkid /dev/$n 2>/dev/null)" ] && continue
+		echo "$(cat $s/size) $n"
+	done
+}
+unpart() {  # desfaz o GPT que um zpool create que falhou deixou (so em discos que free_disks deu como livres)
+	for d; do
+		for p in /dev/$d?*; do [ -b $p ] && zpool labelclear -f $p 2>/dev/null; done
+		s=$(cat /sys/block/$d/size)
+		dd if=/dev/zero of=/dev/$d bs=1M count=2 conv=fsync 2>/dev/null
+		dd if=/dev/zero of=/dev/$d bs=512 seek=$((s-4096)) count=4096 conv=fsync 2>/dev/null
+		blockdev --rereadpt /dev/$d 2>/dev/null
+	done
+}
+
+mount_pool() {  # pool em /mnt/zfs (RAID1 por software); Samba so em /mnt/zfs/samba; estado do Samba no proprio pool
+	for d in tank tank/docker-volumes tank/samba-state; do
+		zfs list $d >/dev/null 2>&1 || zfs create $d
+		[ "$(zfs get -H -o value mountpoint $d)" = legacy ] || zfs set mountpoint=legacy $d
+	done
+	mountpoint -q $POOL || mount -t zfs tank $POOL
+	mountpoint -q /var/lib/samba || mount -t zfs tank/samba-state /var/lib/samba
+	mkdir -p /var/lib/samba/private && chmod 700 /var/lib/samba/private
+	chown root:root $POOL && chmod 755 $POOL       # dados dos apps (/mnt/zfs/<app>_data) fora do Samba
+	mkdir -p $SHARE && chown ${SMBUSER:-smb}: $SHARE
+}
+
+layers() {  # bind do overlay2 + camadas ro da p3; idempotente. O Docker desmonta tudo isso ao parar,
+	# entao o rodockerd (DOCKERD_BINARY) chama isto antes de cada start/restart/respawn do dockerd
+	[ -s /run/docker-root ] && return 0        # manutencao (store on): data-root na p4
+	ismnt $DST || return 0                     # ainda sem seed
+	ismnt $DST/overlay2 || { mount --bind $DST/overlay2 $DST/overlay2 && mount --make-private $DST/overlay2; }
+	[ -d $SRC/overlay2/l ] && [ ! -d $DST/overlay2/l ] && cp -a $SRC/overlay2/l $DST/overlay2/
+	n=0
+	for d in $SRC/overlay2/*/diff; do
+		[ -d "$d" ] || continue
+		l=${d%/diff}; o=$DST/overlay2/${l##*/}
+		mountpoint -q $o/diff && { n=$((n+1)); continue; }
+		mkdir -p $o/diff $o/work
+		for f in link lower committed; do [ -e $l/$f ] && cp -a $l/$f $o/; done
+		mount --bind $d $o/diff && mount -o remount,bind,ro $o/diff && n=$((n+1))
+	done
+	echo "$n camadas ro da p3"
+}
+
+unseed() {
+	for m in $(under $DST); do umount $m 2>/dev/null || umount -l $m; done
+	[ -z "$(under $DST)" ] || die "ainda ha montagens em $DST"
+	rm -rf $DST
+}
+
+seed() {  # data-root em RAM: metadados copiados, camadas em bind ro, volumes no ZFS
+	[ -s /run/docker-root ] && return
+	unseed; mkdir -p $DST
+	# Docker 29 faz bind NAO recursivo do data-root e do overlay2 sobre si mesmos,
+	# escondendo o que esta montado embaixo; ja sendo pontos de montagem, nao faz.
+	mount --bind $DST $DST && mount --make-private $DST
+	mkdir -p $DST/containers $DST/volumes $DST/overlay2
+	logfs $DST/containers
+	for e in $SRC/*; do
+		case ${e##*/} in '*'|overlay2|containers|volumes|lost+found) ;; *) cp -a $e $DST/ ;; esac
+	done
+	layers
+	if hasvol; then mount -t zfs tank/docker-volumes $DST/volumes; else echo "aviso: sem pool, volumes em RAM"; fi
+}
+
+MEM=$(awk '/MemTotal/{print $2}' /proc/meminfo)   # kB; /dev/shm = 3/8 da RAM
+# cache ARC do ZFS: teto de ARC_MB (padrao 1024, /etc/rodocker.conf), nunca acima de 1/4 da RAM
+SHM_KB=$((MEM*3/8)) ARC=$((${ARC_MB:-1024}*1048576)) q=$((MEM/4096*1048576))
+[ $q -lt $ARC ] && ARC=$q
+
+boot() {
+	mount -o remount,exec,nosuid,nodev,size=${SHM_KB}k /dev/shm
+	syslogfs
+	mkdir -p /dev/shm/log/samba /dev/shm/containerd   # log/samba: o smbd tenta o caminho padrao antes de ler o smb.conf
+	rm -f /run/docker-root
+	mount -o remount,ro $SRC 2>/dev/null
+	if modprobe zfs; then
+		# o ZFS ignora arc_max < arc_min (padrao RAM/32, > 1 GiB acima de 32 GB): baixa o min antes
+		echo $((ARC/4)) > /sys/module/zfs/parameters/zfs_arc_min
+		echo $ARC > /sys/module/zfs/parameters/zfs_arc_max
+		zpool list tank >/dev/null 2>&1 || zpool import -N -o cachefile=none -d /dev/disk/by-id tank 2>/dev/null \
+			|| zfs_init auto
+		zpool list tank >/dev/null 2>&1 && mount_pool
+	fi
+	seed
+}
+
+stop() {
+	mountpoint -q $SRC/volumes && umount $SRC/volumes
+	mountpoint -q $SRC/containers && umount $SRC/containers
+	mountpoint -q /var/lib/samba && umount /var/lib/samba
+	mountpoint -q $POOL && umount $POOL
+	[ -s /run/docker-root ] || unseed
+	zpool list tank >/dev/null 2>&1 && zpool export tank
+	return 0
+}
+
+rw() {
+	case $1 in
+	on)  mount -o remount,rw / && mount -o remount,rw /boot/efi && echo "/ em RW (roctl rw off ao terminar)" ;;
+	off) sync; mount -o remount,ro /boot/efi; mount -o remount,ro / && echo "/ em RO" || die "falhou (arquivos abertos?); reinicie" ;;
+	*) die "uso: roctl rw on|off" ;;
+	esac
+}
+
+store() {
+	case $1 in
+	on)
+		rc-service docker stop; unseed || exit 1
+		mount -o remount,rw $SRC || die "nao consegui liberar a p3"
+		mkdir -p $SRC/volumes; hasvol && mount -t zfs tank/docker-volumes $SRC/volumes
+		logfs $SRC/containers   # nem na manutencao os logs vao para o disco de boot
+		echo $SRC > /run/docker-root
+		rc-service docker start; waitd; echo "MANUTENCAO: p3 em RW (roctl store off ao terminar)" ;;
+	off)
+		ids=$(docker ps -q); [ -n "$ids" ] && docker stop $ids
+		docker container prune -f; rc-service docker stop
+		mountpoint -q $SRC/volumes && umount $SRC/volumes
+		mountpoint -q $SRC/containers && umount $SRC/containers
+		sync; mount -o remount,ro $SRC || die "nao consegui travar a p3"
+		rm -f /run/docker-root; seed
+		rc-service docker start; waitd; echo "NORMAL: p3 em RO, data-root em /dev/shm"
+		apps ;;
+	*) die "uso: roctl store on|off" ;;
+	esac
+}
+
+zfs_init() {  # roctl zfs-init [discoA discoB]; sem argumentos usa o 1o par livre de mesmo tamanho
+	A=$1 B=$2 auto=
+	if [ -z "$B" ]; then
+		set -- $(free_disks | sort -n | awk 'p==$1 {print a, $2; exit} {p=$1; a=$2}')
+		[ -n "$2" ] || { echo "ZFS: nenhum par de discos livres de mesmo tamanho; volumes ficam em RAM"; return 1; }
+		# nomes do kernel: o devtmpfs cria sdX1 na hora; um link by-id (ex.: ata-*) pode nunca ganhar o -part1
+		A=/dev/$1 B=/dev/$2 auto=1
+	fi
+	echo "ZFS: criando tank em mirror com $A + $B"
+	if ! zpool create -f -o ashift=12 -o cachefile=none -O compression=lz4 -O atime=off \
+		-O xattr=sa -O acltype=posixacl -O mountpoint=legacy tank mirror "$A" "$B"; then
+		[ -n "$auto" ] && { echo "ZFS: falhou; devolvendo $1 e $2 ao estado livre"; unpart $1 $2; }
+		return 1
+	fi
+	# reimporta por /dev/disk/by-id (como em todo boot) para o status ja mostrar nomes estaveis
+	zpool export tank && zpool import -N -o cachefile=none -d /dev/disk/by-id tank
+	mount_pool
+	zpool status tank
+	if rc-service docker status >/dev/null 2>&1; then
+		rc-service docker stop; seed; rc-service docker start; waitd
+		/etc/local.d/samba.start; apps
+	fi
+}
+
+snap() {  # roctl snap: snapshot recursivo do pool (cron diario 0h); mantem os SNAP_KEEP (padrao 30) mais novos
+	zpool list tank >/dev/null 2>&1 || { echo "roctl snap: sem pool"; return 0; }
+	n=auto-$(date +%Y-%m-%d_%H%M%S)
+	zfs snapshot -r tank@$n && echo "tank@$n"
+	zfs list -H -t snapshot -o name -s creation -d 1 tank | grep '^tank@auto-' \
+		| awk -v k=${SNAP_KEEP:-30} '{a[NR]=$0} END {for (i=1; i<=NR-k; i++) print a[i]}' \
+		| while read -r o; do zfs destroy -r "$o" && echo "removido $o"; done
+}
+
+check() {
+	ok=0 bad=0
+	t() { if eval "$2" >/dev/null 2>&1; then echo "PASS  $1"; ok=$((ok+1)); else echo "FAIL  $1"; bad=$((bad+1)); fi; }
+	isro() { grep -qE "^[^ ]+ $1 [^ ]+ ro[, ]" /proc/mounts; }
+	t "/ ro"                   "isro /"
+	t "/boot/efi ro"           "isro /boot/efi"
+	t "p3 ro"                  "isro $SRC"
+	t "escrita em / falha"     "! touch /.rotest"
+	t "escrita na p3 falha"    "! touch $SRC/.rotest"
+	t "syslog em /dev/shm/log" "test -s /dev/shm/log/messages"
+	t "docker.log em /dev/shm" "test -e /dev/shm/log/docker.log"
+	t "docker em $DST overlay2" "docker info -f '{{.DockerRootDir}} {{.Driver}}' | grep -qx '$DST overlay2'"
+	t "logs do sistema <= 100 MiB" "df -k /dev/shm/log | awk 'NR==2{exit !(\$1==\"syslogs\" && \$2<=$SYSLOG_KB)}' && grep -q -- '-s 20480 -b 3' /etc/conf.d/syslog"
+	t "logs do Docker <= 100 MiB" "df -k $DST/containers | awk 'NR==2{exit !(\$1==\"dockerlogs\" && \$2<=$CLOG_KB)}' && grep -q 'log-driver.: .local' /etc/docker/daemon.json && grep -q '^LOGPROXY_ROTATED_FILES=2' /etc/conf.d/docker"
+	if zpool list tank >/dev/null 2>&1; then
+		t "pool tank ONLINE"   "zpool list -H -o health tank | grep -qx ONLINE"
+		t "volumes no ZFS"     "grep -q '^tank/docker-volumes $DST/volumes zfs' /proc/mounts"
+		t "pool em $POOL"      "grep -q '^tank $POOL zfs' /proc/mounts"
+		t "snapshot diario 0h (cron)" "grep -q '^0 0 \\* \\* \\* /usr/local/sbin/roctl snap' /etc/crontabs/root"
+		t "Samba compartilhando $SHARE" "pidof smbd && testparm -s 2>/dev/null | grep -q 'path = $SHARE\$'"
+	else
+		echo "SKIP  ZFS (sem par de discos livres de mesmo tamanho; volumes em RAM)"
+	fi
+	t "ARC max = $((ARC/1048576)) MiB" "grep -q '^c_max .* $ARC\$' /proc/spl/kstat/zfs/arcstats"
+	t "/dev/shm = 3/8 da RAM"  "df -k /dev/shm | awk 'NR==2{exit \$2<$SHM_KB-4 || \$2>$SHM_KB+4}'"
+	echo "RESULTADO: $ok PASS, $bad FAIL"; [ $bad -eq 0 ]
+}
+
+case $1 in
+	boot|stop|seed|layers|snap|check) $1 ;;
+	rw|store) $1 $2 ;;
+	zfs-init) shift; zfs_init "$@" ;;
+	*) echo "uso: roctl rw on|off | store on|off | zfs-init [A B] | snap | check | boot|stop|seed|layers"; exit 1 ;;
+esac

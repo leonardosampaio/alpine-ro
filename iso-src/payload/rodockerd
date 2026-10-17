@@ -1,0 +1,5 @@
+#!/bin/sh
+# DOCKERD_BINARY (conf.d/docker): remonta as camadas ro antes de todo start/restart/respawn do dockerd,
+# que as desmonta ao parar (sem isso um "rc-service docker restart" sobe containers com rootfs vazio)
+/usr/local/sbin/roctl layers
+exec /usr/bin/dockerd "$@"

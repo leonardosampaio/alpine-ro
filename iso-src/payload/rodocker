@@ -1,0 +1,5 @@
+#!/sbin/openrc-run
+description="Alpine RO: /dev/shm, pool ZFS e data-root do Docker"
+depend() { need localmount; after udev-settle; before logger bootmisc networking docker; }
+start() { ebegin "Preparando sistema somente leitura"; /usr/local/sbin/roctl boot; eend $?; }
+stop()  { ebegin "Liberando data-root e pool ZFS"; /usr/local/sbin/roctl stop; eend $?; }

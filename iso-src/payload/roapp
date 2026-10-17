@@ -1,0 +1,170 @@
+#!/bin/sh
+# roapp - recria containers no boot (o estado do Docker fica em /dev/shm e some a cada reboot)
+# Definicoes em /etc/roapps (no /, ro: so o root altera); dados em /mnt/zfs/<app>_data (ZFS).
+#   <app>.app  IMAGE=, OPTS= (opcoes do docker run), CMD=, ZFS= (vazio = automatico; 0 = sobe sem pool com
+#              volumes nomeados na RAM; binds em /mnt/zfs nunca sobem sem pool)
+#   <app>.yml  docker compose (projeto <app>; $DATA = /mnt/zfs/<app>_data)
+# Em OPTS, "-v @:/dst" vira "-v /mnt/zfs/<app>_data:/dst" e "-v @sub:/dst" vira ".../<app>_data/sub:/dst".
+R=/etc/roapps POOL=/mnt/zfs
+die() { echo "roapp: $*" >&2; exit 1; }
+data() { echo $POOL/${1}_data; }
+haspool() { mountpoint -q $POOL; }
+waitd() { for i in $(seq 60); do docker info >/dev/null 2>&1 && return; sleep 1; done; die "docker nao respondeu"; }
+apps() { for f in $R/*.app $R/*.yml; do [ -f "$f" ] && { f=${f##*/}; echo ${f%.*}; }; done | sort -u; }
+kind() { [ -f $R/$1.yml ] && echo compose || { [ -f $R/$1.app ] && echo run; }; }
+valid() { echo "$1" | grep -qE '^[a-z0-9][a-z0-9_.-]*$' || die "nome invalido: $1 (use a-z, 0-9, _ . -)"; }
+
+wr() {   # libera / para gravar em /etc/roapps; unwr volta como estava
+	was_ro=; grep -qE '^[^ ]+ / [^ ]+ ro[, ]' /proc/mounts && { roctl rw on >/dev/null || die "nao consegui liberar /"; was_ro=1; }
+	mkdir -p $R
+}
+unwr() { [ -z "$was_ro" ] || roctl rw off >/dev/null; }
+
+load() {   # le <app>.app e deixa em "$@" os argumentos do docker run (sem --name/-d); define NEED
+	app=$1 IMAGE= OPTS= CMD= ZFS=; . $R/$1.app
+	[ -n "$IMAGE" ] || die "$1: IMAGE vazio em $R/$1.app"
+	eval "set -- $OPTS"   # $1 deixa de ser o nome: dai em diante usar $app
+	NEED=0 c=$# prev= rp=--restart=unless-stopped
+	for a; do
+		case $prev in -v|--volume)
+			case $a in
+			@*) r=${a#@}; s=${r%%:*}; h=$(data $app)${s:+/$s}; a=$h:${r#*:}; NEED=1 ;;
+			/mnt/zfs*) NEED=1 ;;
+			/*|.*) ;;
+			*) NEED=1 ;;   # volume nomeado: vai para tank/docker-volumes
+			esac ;;
+		esac
+		case $a in --restart|--restart=*) rp= ;; esac
+		set -- "$@" "$a"; prev=$a
+	done
+	shift $c
+	[ -n "$ZFS" ] && NEED=$ZFS
+	eval "set -- $rp \"\$@\" \"\$IMAGE\" $CMD"
+	ARGS=$(for a; do printf '%s\n' "$a"; done)
+}
+
+up_one() {
+	n=$1 k=$(kind $1)
+	[ -n "$k" ] || { echo "$n: nao existe"; return 1; }
+	if [ $k = compose ]; then
+		haspool || { echo "$n: sem pool em $POOL, nao subo (os dados ficariam na RAM)"; return 0; }
+		mkdir -p $(data $n)
+		DATA=$(data $n) docker compose -p $n -f $R/$n.yml up -d --remove-orphans
+		return
+	fi
+	if docker container inspect $n >/dev/null 2>&1; then   # so adota container criado pelo roapp (label roapp.app)
+		[ "$(docker container inspect -f '{{index .Config.Labels "roapp.app"}}' $n)" = $n ] || {
+			echo "$n: ja existe um container $n criado fora do roapp; nao mexo (roapp recreate $n o substitui)"; return 1; }
+		docker start $n >/dev/null; echo "$n: ok"; return
+	fi
+	load $n
+	[ $NEED = 1 ] && ! haspool && { echo "$n: sem pool em $POOL, nao subo (os dados ficariam na RAM)"; return 0; }
+	docker image inspect "$IMAGE" >/dev/null 2>&1 || echo "$n: aviso: $IMAGE nao esta no disco de imagens; vai para a RAM (roapp pull $n)"
+	eval "set -- $(printf '%s\n' "$ARGS" | sed "s/'/'\\\\''/g; s/.*/'&'/" | tr '\n' ' ')"
+	for a; do case $a in $POOL/*:*)   # sem pool, /mnt/zfs e o / (ro): nao ha onde guardar, nem com ZFS=0
+		haspool || { echo "$n: usa $POOL e nao ha pool, nao subo"; return 0; }
+		mkdir -p "${a%%:*}" ;; esac; done
+	docker run -d --name $n --label roapp.app=$n "$@" >/dev/null && echo "$n: criado"
+}
+
+down_one() {
+	case $(kind $1) in
+	compose) docker compose -p $1 -f $R/$1.yml down ;;
+	*) docker rm -f $1 >/dev/null 2>&1 && echo "$1: removido" ;;
+	esac
+}
+
+images() {   # imagens usadas pelos apps dados
+	for n; do
+		case $(kind $n) in
+		compose) docker compose -p $n -f $R/$n.yml config --images 2>/dev/null ;;
+		run) (IMAGE=; . $R/$n.app; echo $IMAGE) ;;
+		esac
+	done | sort -u
+}
+
+pull() {   # grava as imagens no disco (store on/off apaga TODOS os containers; o store off chama roapp up)
+	[ $# -gt 0 ] || set -- $(apps)
+	for n; do [ -n "$(kind $n)" ] || die "$n: nao existe"; done
+	L=$(images "$@"); [ -n "$L" ] || die "nenhuma imagem"
+	roctl store on || exit 1
+	for i in $L; do docker pull $i || echo "falhou: $i"; done
+	roctl store off
+}
+
+quote() {   # um argumento para OPTS (que fica entre aspas simples no arquivo)
+	case $1 in
+	*[!A-Za-z0-9_@%+=:,./-]*)
+		case $1 in *[\"\'\$\`\\]*) die "argumento com aspas/\$/\\: edite $R/<app>.app a mao" ;; esac
+		printf '"%s"' "$1" ;;
+	*) printf '%s' "$1" ;;
+	esac
+}
+
+add() {   # roapp add NOME IMAGEM [opcoes do docker run] [-- comando]
+	n=$1 img=$2; [ -n "$img" ] || die "uso: roapp add NOME IMAGEM [opcoes docker run] [-- comando]"
+	valid $n; shift 2
+	[ -f $R/$n.yml ] && die "$n ja existe como compose"
+	o= c=
+	while [ $# -gt 0 ]; do [ "$1" = -- ] && { shift; break; }; o="$o${o:+ }$(quote "$1")" || exit 1; shift; done
+	for a; do c="$c${c:+ }$(quote "$a")" || exit 1; done
+	wr
+	{ echo "# roapp: $n (docker run). Depois de editar: roapp recreate $n"
+	  echo "IMAGE='$img'"; echo "OPTS='$o'"; echo "CMD='$c'"; echo "ZFS="; } > $R/$n.app
+	unwr
+	echo "gravado $R/$n.app"; finish $n
+}
+
+compose() {   # roapp compose NOME ARQUIVO.yml
+	n=$1 f=$2; [ -f "$f" ] || die "uso: roapp compose NOME ARQUIVO.yml"
+	valid $n; [ -f $R/$n.app ] && die "$n ja existe como docker run"
+	docker compose version >/dev/null 2>&1 || die "falta o docker compose: roctl rw on; apk add docker-cli-compose; roctl rw off"
+	DATA=$(data $n) docker compose -p $n -f "$f" config -q || die "compose invalido"
+	wr; cp "$f" $R/$n.yml; unwr
+	echo "gravado $R/$n.yml"; finish $n
+}
+
+finish() {   # imagem fora do disco: grava (o store off recria tudo); senao so sobe
+	for i in $(images $1); do docker image inspect $i >/dev/null 2>&1 || { pull $1; return; }; done
+	up_one $1
+}
+
+ls_() {
+	printf '%-16s %-8s %-36s %s\n' APP TIPO IMAGEM ESTADO
+	for n in $(apps); do
+		k=$(kind $n)
+		if [ $k = run ]; then i=$(images $n); s=$(docker container inspect -f '{{.State.Status}}' $n 2>/dev/null | grep .) || s=ausente
+		else i=$(images $n | tr '\n' ' '); s=$(docker ps -a --filter label=com.docker.compose.project=$n --format '{{.State}}' | sort | uniq -c | tr -s ' \n' '  ')
+			[ -n "$s" ] || s=ausente; fi
+		printf '%-16s %-8s %-36s %s\n' $n $k "$i" "$s"
+	done
+}
+
+rm_() {   # remove a definicao e o container; os dados ficam
+	[ -n "$(kind $1)" ] || die "$1: nao existe"
+	down_one $1; wr; rm -f $R/$1.app $R/$1.yml; unwr
+	[ -d $(data $1) ] && echo "$1: dados mantidos em $(data $1)"; return 0
+}
+
+cmd=$1; [ $# -gt 0 ] && shift
+case $cmd in
+	up|recreate|down) [ $cmd = up ] || [ $# -gt 0 ] || die "uso: roapp $cmd NOME..."
+		waitd; [ $# -gt 0 ] || set -- $(apps)
+		for n; do case $cmd in recreate) down_one $n; up_one $n ;; down) down_one $n ;; *) up_one $n ;; esac; done ;;
+	add) add "$@" ;;
+	compose) compose "$@" ;;
+	pull) pull "$@" ;;
+	ls) ls_ ;;
+	show) [ -n "$(kind $1)" ] || die "uso: roapp show NOME"; cat $R/$1.app $R/$1.yml 2>/dev/null ;;
+	rm) [ -n "$1" ] || die "uso: roapp rm NOME"; rm_ $1 ;;
+	*) cat <<EOF
+uso: roapp add NOME IMAGEM [opcoes do docker run] [-- comando]   cria e sobe (grava a imagem se faltar)
+     roapp compose NOME ARQUIVO.yml   app via docker compose (\$DATA = $POOL/NOME_data)
+     roapp up [NOME...]          cria o que falta (roda no boot e apos roctl store off)
+     roapp recreate NOME...      remove e cria de novo (apos editar $R/NOME.app)
+     roapp pull [NOME...]        atualiza as imagens no disco (apaga e recria TODOS os containers)
+     roapp down NOME... | rm NOME | ls | show NOME
+Dados: "-v @:/dst" = $POOL/NOME_data:/dst; volumes nomeados vao para tank/docker-volumes.
+EOF
+	exit 1 ;;
+esac
