@@ -1,0 +1,53 @@
+#!/bin/sh
+# rodiag: relatorio da maquina para avaliar antes de instalar (roda no live; nao grava em disco).
+# Na entrada "diagnostico" do menu roda sozinho; a mao: rodiag (relatorio em /tmp/rodiag.txt).
+R=/tmp/rodiag.txt
+sec() { echo; echo "===== $* ====="; }
+drv() { l=$(readlink "$1" 2>/dev/null) && basename "$l" || echo nenhum; }
+hex() { sed 's/^0x//' "$1" 2>/dev/null; }
+{
+sec "sistema"
+echo "data: $(date)"; echo "kernel: $(uname -r)"; echo "cmdline: $(cat /proc/cmdline)"
+[ -d /sys/firmware/efi ] && echo "firmware: UEFI" || echo "firmware: BIOS (legado/CSM)"
+for f in sys_vendor product_name board_vendor board_name bios_vendor bios_version bios_date; do
+	[ -r /sys/class/dmi/id/$f ] && echo "$f: $(cat /sys/class/dmi/id/$f)"
+done
+
+sec "cpu e memoria"
+grep -m1 'model name' /proc/cpuinfo; echo "nucleos: $(grep -c '^processor' /proc/cpuinfo)"
+echo "virtualizacao: $(grep -owE 'vmx|svm' /proc/cpuinfo | sort -u | tr '\n' ' ')"
+free -m
+
+sec "video"
+for d in /sys/bus/pci/devices/*; do
+	case $(cat $d/class) in 0x03*) echo "${d##*/} id=$(hex $d/vendor):$(hex $d/device) driver=$(drv $d/driver)" ;; esac
+done
+echo "drm: $(ls /sys/class/drm 2>/dev/null | tr '\n' ' ')"; echo "framebuffer: $(cat /proc/fb 2>/dev/null | tr '\n' ' ')"
+
+sec "pci (endereco classe vendor:device driver)"
+for d in /sys/bus/pci/devices/*; do echo "${d##*/} $(cat $d/class) $(hex $d/vendor):$(hex $d/device) $(drv $d/driver)"; done
+
+sec "discos"
+for s in /sys/block/*; do
+	n=${s##*/}; case $n in loop*|ram*|zram*|dm-*) continue ;; esac
+	echo "$n $(($(cat $s/size)/2097152))G removivel=$(cat $s/removable) ro=$(cat $s/ro)$(readlink -f $s | grep -q /usb && echo ' USB') modelo=$(cat $s/device/model 2>/dev/null | tr -s ' ')"
+	for p in $s/$n?*; do [ -d "$p" ] && echo "   particao ${p##*/} $(($(cat $p/size)/2048))M"; done
+	blkid /dev/$n /dev/$n?* 2>/dev/null | sed 's/^/   /'
+done
+
+sec "simulacao do instalador (DRYRUN: nao apaga nada)"
+DRYRUN=1 /usr/local/sbin/install-ro 2>&1
+
+sec "rede"
+for i in /sys/class/net/*; do
+	n=${i##*/}; [ $n = lo ] && continue
+	echo "$n mac=$(cat $i/address) link=$(cat $i/carrier 2>/dev/null || echo ?) driver=$(drv $i/device/driver)"
+done
+ip -4 addr | grep inet
+
+sec "kernel: erros e avisos (video, firmware, discos)"
+dmesg | grep -iE 'error|fail|warn|firmware|i915|drm|nouveau|radeon|amdgpu|efifb|vesafb|simplefb|timeout|ata[0-9]|nvme' | tail -80
+} 2>&1 | tee $R
+echo
+echo ">>> relatorio em $R: 'less $R'. Login: root (sem senha)."
+echo ">>> copiar para outro pendrive FAT: mount /dev/sdX1 /mnt && cp $R /mnt/ && umount /mnt"

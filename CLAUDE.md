@@ -21,7 +21,9 @@ Qualquer coisa que precise escrever em runtime vai para `/run`, `/dev/shm` ou um
 - `build.sh` (host): `docker build` + `docker run -u $(id -u) -v $PWD/out:/out`. Argumento opcional: versao do Alpine ou `latest`.
 - `Dockerfile`: `alpine:3.24` + `xorriso` + `tar` (GNU, para `--owner=0` no overlay).
 - `iso-src/build.sh` (container): resolve `latest` pelo `latest-releases.yaml`, baixa o ISO oficial e confere o SHA256 (cache em `/out`), cria `localhost.apkovl.tar.gz`, extrai os menus com `xorriso -osirrox on -extract`, aplica o `dup-entry.awk` e roda `xorriso -indev <iso> -outdev <novo> -boot_image any replay -map ...`.
-- `iso-src/payload/install-ro.sh`: instalador. Particiona, roda `setup-disk`, instala pacotes, grava configs e instala GRUB i386-pc + x86_64-efi.
+- `iso-src/payload/install-ro.sh`: instalador. Particiona, roda `setup-disk`, instala pacotes, grava configs e instala GRUB i386-pc + x86_64-efi. `DRYRUN=1` para depois de escolher o disco e testar rede/repositorio.
+- `iso-src/payload/rodiag`: relatorio da maquina no live (firmware, DMI, CPU, RAM, video/driver, PCI, discos, `DRYRUN=1 install-ro`, rede, `dmesg`) em `/tmp/rodiag.txt`; roda sozinho com `rodiag` no cmdline (`local.d/rodiag.start`).
+- Menu do ISO (`dup-entry.awk`): `Linux lts`, `roinstall` (autoinstall), `rosafe` (autoinstall + `nomodeset`), `rodiag` (`nomodeset ignore_loglevel earlyprintk=efi|vga,keep initcall_debug`); sem `quiet` e com `initramfs_async=0` em todas; GRUB com `gfxpayload=keep`.
 - `iso-src/payload/roctl`: toda a logica de runtime (`boot`, `stop`, `seed`, `layers`, `rw`, `store`, `zfs-init`, `snap`, `check`). `check` tem 17 itens com pool; sem pool, 12 + `SKIP ZFS`.
 - `iso-src/payload/rodocker`: servico OpenRC (runlevel boot), wrapper do `roctl boot/stop`.
 - `iso-src/payload/rodockerd`: `DOCKERD_BINARY`; roda `roctl layers` e faz `exec dockerd`.
@@ -45,6 +47,9 @@ Qualquer coisa que precise escrever em runtime vai para `/run`, `/dev/shm` ou um
 - **busybox `awk` não aceita `{` ou `}` soltos em regex**: usar `[{]` e `[}]`.
 - **busybox `ash` não tem `export -f`**; manter tudo POSIX sh.
 - O overlay precisa ser root:root no tar (`--owner=0 --group=0`); o container roda como o usuario do host e sem isso o live herdaria `/etc` com outro dono.
+- **Tela preta em UEFI antigo (ex.: H61) depois do GRUB**: o `quiet` do Alpine esconde ate o init (o `ebegin` dele nao imprime com `quiet`) e, sem `gfxpayload=keep`, o kernel pode ficar sem console ate o driver de video. O menu tira o `quiet`, poe `gfxpayload=keep` e oferece `rosafe`/`rodiag`; o `install-ro` grava `GRUB_GFXPAYLOAD_LINUX=keep` e repassa `nomodeset` do live ao sistema instalado.
+- **`initramfs_async=0` em todas as entradas e no cmdline do sistema instalado**: na H61 (UEFI Aptio de 2011) o boot travava logo apos `PM: genpd: Disabling unused power domains`, esperando a descompactacao assincrona do initramfs; com o parametro (descompacta em sequencia) bootou.
+- **Ventoy**: o hook dele para Alpine copia o `modloop` inteiro (~300 MB no 3.24) para a RAM antes do init ("Mounting boot media, please wait ......", do Ventoy); em QEMU, BIOS e UEFI bootam (Ventoy 1.1.18, ISO em FAT32). `INIT NOT FOUND` (o initramfs do Alpine nao chegou) foi relatado em bare metal e nao reproduziu.
 - O menu do ISO oficial espera 1 s; o `dup-entry.awk` sobe para 10 s (GRUB `timeout=10`, syslinux `TIMEOUT 100`).
 - Overlay do live: precisa de `etc/.default_boot_services`, senão o live perde os serviços padrão.
 - Interfaces: `net.ifnames=0` no cmdline do sistema instalado (eudev renomearia `eth0`).
@@ -71,7 +76,7 @@ Escrever em `/`: `roctl rw on` (remonta `/` e `/boot/efi` rw) e depois `roctl rw
 ## Convenções
 
 - Shell: POSIX sh compatível com busybox. Rodar `sh -n` em tudo antes de entregar.
-- Scripts `.sh`, `roctl`, `roapp`, `rodocker`, `rodockerd` e `.awk`: **LF**. O `Dockerfile` também faz `sed 's/\r$//'` por segurança.
+- Scripts `.sh`, `roctl`, `roapp`, `rodiag`, `rodocker`, `rodockerd` e `.awk`: **LF**. O `Dockerfile` também faz `sed 's/\r$//'` por segurança.
 - Textos e mensagens em português, sem acentos nos scripts (consoles e serial).
 - O ZFS é criado no **1º boot do sistema instalado**, e não no live: o `zfs-lts` do repositório pode não casar com o kernel do ISO.
 
@@ -105,7 +110,8 @@ Tudo abaixo validado em QEMU no WSL2 em 2026-10-17, com TCG (o WSL nao expunha `
 - **Disco de boot**: 0 KiB escritos em 5 min de carga.
 - **Falhas**: disco do mirror arrancado com escrita continua (DEGRADED, tudo segue, `check` acusa); reboot degradado; troca a quente + resilver; `quit` com escrita no pool e no meio de `docker pull` em `store on` (p4: `recovering journal` -> clean, camadas reaproveitadas); `/dev/shm` 100% (so `docker run` novo falha); reboot com `rw on` / `store on` esquecidos volta a ro.
 - Em TCG o boot com muitas camadas leva >1 min ate o `roapp up` terminar: esperar antes do `check`.
-- **Pendente:** nada dos cenarios planejados.
+- **Bare metal validado (2026-10-18)**: placa TGT H61 (LGA1155, UEFI Aptio de 2011, sem Legacy/CSM), SSD de ~112 GB. Antes: em UEFI o live travava logo apos `PM: genpd: Disabling unused power domains` (espera do initramfs) e pelo Ventoy dava `INIT NOT FOUND`; com `initramfs_async=0` bootou. Instalacao ok (p3 20 GiB, p4 91 GiB), 1o boot ok (DHCP), `check` 12 PASS + `SKIP ZFS` (um disco so). O sistema instalado bootou mesmo sem `initramfs_async=0` (initramfs dele e menor); o parametro foi mantido por seguranca.
+- **Pendente:** ZFS + Samba em bare metal (precisa de 2 discos vazios do mesmo tamanho); Ventoy em bare metal com o ISO atual.
 - Ideias em aberto: instalacao offline (pacotes embutidos no ISO); "Versoes anteriores" do Samba com os snapshots (`vfs_shadow_copy2`).
 
 ## Segurança
@@ -113,3 +119,4 @@ Tudo abaixo validado em QEMU no WSL2 em 2026-10-17, com TCG (o WSL nao expunha `
 - Nao embutir chave de teste no ISO: nas VMs, o `vm-test.sh` passa a chave do usuario por fw_cfg. Nunca versionar chave privada.
 - `iso-src/payload/authorized_keys` é embutido no ISO: em produção, usar a chave do próprio usuário ou remover o arquivo.
 - Senhas padrão (`alpine`) só para teste; documentar `ROOTPW` e `SMBPW`.
+- Root no SSH so por chave (`prohibit-password`, padrao do OpenSSH): a senha so vale no console. Nao liberar `PermitRootLogin yes` de forma permanente; o README ensina a liberar so para o `ssh-copy-id`.

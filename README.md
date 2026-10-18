@@ -56,13 +56,36 @@ Para embutir sua chave SSH no sistema instalado, coloque-a em `iso-src/payload/a
 1. Grave o ISO num pendrive com **Rufus (modo DD)** ou **balenaEtcher**.
 2. **Desative o Secure Boot** (o GRUB do Alpine não é assinado).
 3. Conecte o cabo de rede: a instalação baixa os pacotes (DHCP).
-4. No menu de boot (10 s):
-   - **Linux lts**: live; faça login como `root` e rode `install-ro`.
-   - **Alpine RO - instalar automaticamente**: instala sozinho e desliga. **Apaga o disco escolhido.**
+4. No menu de boot (10 s; no BIOS o prompt `boot:` lista os nomes a digitar):
+
+| Entrada (UEFI) | No BIOS | O que faz |
+|---|---|---|
+| Linux lts | Enter | live; login `root` (sem senha) e `install-ro` |
+| Alpine RO - instalar automaticamente | `roinstall` | instala sozinho e desliga. **Apaga o disco escolhido** |
+| Alpine RO - instalar, vídeo básico | `rosafe` | o mesmo com `nomodeset` (vai também para o sistema instalado) |
+| Alpine RO - diagnóstico | `rodiag` | não instala: relatório da máquina e login no live |
+
+Todas as entradas mostram as mensagens do kernel (sem `quiet`) e usam `initramfs_async=0`: numa placa H61 com UEFI de 2011 o boot travava logo após `PM: genpd: Disabling unused power domains`, esperando a descompactação do initramfs, e com esse parâmetro passou (instalação e sistema instalado testados nela). O sistema instalado recebe o mesmo parâmetro.
+
+**Se o boot travar ou a tela ficar preta**: tente `rosafe` / "vídeo básico", o modo **Legacy/CSM** se a placa tiver (na lista de boot, o pendrive sem o prefixo `UEFI:`) e o diagnóstico, que mostra as mensagens desde o início (`earlyprintk`) e cada etapa do kernel (`initcall_debug`): a última linha na tela diz onde parou. A instalação automática não depende da tela: se a máquina desligar sozinha depois de alguns minutos, instalou.
+
+O **diagnóstico** (`rodiag`, também à mão no live) mostra firmware, placa, CPU, RAM, vídeo e driver, discos (tamanho, removível, partições, assinaturas), qual disco seria apagado e se a rede e o repositório respondem (`DRYRUN=1 install-ro`, sem gravar nada), e os erros do kernel. Fica em `/tmp/rodiag.txt`; para levar para outro PC, copie para outro pendrive FAT: `mount /dev/sdX1 /mnt && cp /tmp/rodiag.txt /mnt/ && umount /mnt`.
+
+**Ventoy**: funciona nos dois modos, mas antes de iniciar o Alpine o Ventoy copia o `modloop` (~300 MB) para a RAM ("Mounting boot media, please wait ......"), o que pode levar alguns minutos em USB 2.0. Se aparecer `INIT NOT FOUND` (o initramfs do Alpine não chegou à memória; visto na mesma H61), grave o ISO direto com balenaEtcher/Rufus (modo DD).
 
 Disco de boot: o **menor disco interno ≥ 32 GiB** (nunca USB nem o próprio pendrive). Para escolher, use `rodisk=/dev/sdX` no cmdline do boot ou `DISK=/dev/sdX install-ro`.
 
-Senhas padrão: root `alpine`, Samba (usuário `smb`) `alpine`. Para trocar, use `ROOTPW=... SMBPW=... install-ro`.
+Senhas padrão: root `alpine`, Samba (usuário `smb`) `alpine`. Para trocar, use `ROOTPW=... SMBPW=... install-ro`. A senha do root vale **só no console**: no SSH o root entra **só por chave** (`PermitRootLogin prohibit-password`, padrão do OpenSSH).
+
+Para ter SSH desde o 1º boot, ponha sua chave em `iso-src/payload/authorized_keys` antes do build. Num sistema já instalado sem chave, libere a senha só por um instante:
+
+```sh
+# no console da maquina
+roctl rw on && echo "PermitRootLogin yes" >> /etc/ssh/sshd_config && rc-service sshd restart
+# no seu PC
+ssh-copy-id root@IP-DO-SERVIDOR
+ssh root@IP-DO-SERVIDOR 'sed -i "/^PermitRootLogin yes$/d" /etc/ssh/sshd_config && rc-service sshd restart && roctl rw off'
+```
 
 Outras variáveis do `install-ro`: `TZ` (fuso, padrão `America/Sao_Paulo`; define a hora do snapshot diário) e `SNAP_KEEP` (snapshots mantidos, padrão 30). Ex.: `TZ=Europe/Lisbon SNAP_KEEP=14 install-ro`.
 
@@ -288,7 +311,8 @@ iso-src/
   build.sh             roda no container: baixa o ISO, overlay, menus, xorriso
   dup-entry.awk        duplica a entrada do GRUB/syslinux com "autoinstall"
   payload/
-    install-ro.sh      instalador (vira /usr/local/sbin/install-ro no live)
+    install-ro.sh      instalador (vira /usr/local/sbin/install-ro no live; DRYRUN=1 so simula)
+    rodiag             relatorio da maquina no live (entrada "diagnostico" do menu)
     roctl              ferramenta de controle do sistema instalado
     roapp              apps Docker recriados no boot (/etc/roapps)
     rodocker           servico OpenRC de boot (chama roctl boot/stop)

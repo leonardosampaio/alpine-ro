@@ -4,6 +4,7 @@
 # em /mnt/zfs (RAID1 por software); Samba em \\<host>\zfs = /mnt/zfs/samba. Apps: roapp (/etc/roapps). Funciona em BIOS e UEFI. Senhas: ROOTPW, SMBPW (padrao: alpine).
 # TZ (padrao America/Sao_Paulo; vale para o snapshot diario das 0h), SNAP_KEEP (snapshots mantidos, padrao 30).
 # Disco de boot: rodisk=/dev/X no cmdline do kernel, variavel DISK, ou o MENOR disco interno (>= 32 GiB).
+# DRYRUN=1: so escolhe o disco e testa rede/repositorio, sem gravar nada (usado pelo rodiag).
 set -e
 CFG=${CFG:-/usr/share/rodocker} T=/mnt
 step() { echo; echo "=== $* ==="; }
@@ -44,6 +45,10 @@ done
 [ -n "$up" ] || { echo "sem rede com DHCP (a instalacao baixa pacotes)"; exit 1; }
 echo "rede: $up"
 V=$(cut -d. -f1,2 /etc/alpine-release) M=https://dl-cdn.alpinelinux.org/alpine
+if [ -n "$DRYRUN" ]; then   # rodiag: so mostra o que faria; nada e particionado
+	wget -q --spider $M/v$V/main/x86_64/APKINDEX.tar.gz && echo "repositorio $M: ok" || echo "repositorio $M: INACESSIVEL"
+	trap - EXIT; echo "DRYRUN: $DISK seria APAGADO; nada foi gravado"; exit 0
+fi
 printf '%s/v%s/main\n%s/v%s/community\n' $M $V $M $V > /etc/apk/repositories
 apk update && apk add sfdisk e2fsprogs dosfstools
 for m in $T/dev $T/proc $T/sys $T/boot/efi $T; do umount $m 2>/dev/null || true; done
@@ -189,9 +194,12 @@ for s in udev:sysinit udev-trigger:sysinit udev-settle:sysinit udev-postmount:de
 	c rc-update add ${s%%:*} ${s#*:}
 done
 c rc-update del mdev sysinit 2>/dev/null || true
-sed -i '/^GRUB_CMDLINE_LINUX_DEFAULT=/d; /^GRUB_TIMEOUT=/d' $T/etc/default/grub
-echo 'GRUB_TIMEOUT=3
-GRUB_CMDLINE_LINUX_DEFAULT="modules=sd-mod,nvme,ext4 rootfstype=ext4 ro net.ifnames=0 console=ttyS0,115200 console=tty0"' >> $T/etc/default/grub
+# instalado pela entrada "video basico": a mesma placa precisa do nomodeset no sistema instalado
+NM=; grep -qw nomodeset /proc/cmdline && NM=" nomodeset"
+sed -i '/^GRUB_CMDLINE_LINUX_DEFAULT=/d; /^GRUB_TIMEOUT=/d; /^GRUB_GFXPAYLOAD_LINUX=/d' $T/etc/default/grub
+echo "GRUB_TIMEOUT=3
+GRUB_GFXPAYLOAD_LINUX=keep
+GRUB_CMDLINE_LINUX_DEFAULT=\"modules=sd-mod,nvme,ext4 rootfstype=ext4 ro net.ifnames=0 initramfs_async=0 console=ttyS0,115200 console=tty0$NM\"" >> $T/etc/default/grub
 c grub-install --target=i386-pc $DISK                       # BIOS (legacy/CSM)
 c grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=alpine --removable --no-nvram
 if [ -n "$EFI" ]; then                                       # entrada na NVRAM da placa-mae

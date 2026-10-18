@@ -28,6 +28,7 @@ fi
 echo "=== [2/4] overlay do live (localhost.apkovl.tar.gz) ==="
 mkdir -p $O/usr/local/sbin $O/usr/share/rodocker $O/etc/local.d $O/etc/runlevels/default $O/etc/apk
 install -m 755 $S/payload/install-ro.sh $O/usr/local/sbin/install-ro
+install -m 755 $S/payload/rodiag $O/usr/local/sbin/rodiag
 install -m 755 $S/payload/roctl $S/payload/rodocker $S/payload/roapp $S/payload/rodockerd $O/usr/share/rodocker/
 [ -f $S/payload/authorized_keys ] && install -m 600 $S/payload/authorized_keys $O/usr/share/rodocker/
 touch $O/etc/.default_boot_services                  # mantem os servicos padrao do live
@@ -47,12 +48,20 @@ grep -qw autoinstall /proc/cmdline || exit 0
 } 2>&1 | tee /dev/tty1 /dev/ttyS0 2>/dev/null
 EOF
 chmod 755 $O/etc/local.d/autoinstall.start
+cat > $O/etc/local.d/rodiag.start <<'EOF'
+#!/bin/sh
+# entrada "diagnostico" do menu: relatorio da maquina, sem instalar nada
+grep -qw rodiag /proc/cmdline || exit 0
+/usr/local/sbin/rodiag 2>&1 | tee /dev/tty1 /dev/ttyS0 >/dev/null 2>&1
+EOF
+chmod 755 $O/etc/local.d/rodiag.start
 cat > $O/etc/motd <<'EOF'
 
   Alpine RO (/, /boot/efi e imagens Docker somente leitura; containers em /dev/shm; volumes e /mnt/zfs em ZFS RAID1 + Samba)
 
   install-ro           instala no menor disco interno >= 32 GiB (APAGA o disco)
   DISK=/dev/X install-ro   escolhe o disco      (ou rodisk=/dev/X no boot)
+  rodiag               relatorio da maquina (firmware, video, discos, rede); nao grava nada
 
 EOF
 find $O -type d -exec chmod 755 {} +
