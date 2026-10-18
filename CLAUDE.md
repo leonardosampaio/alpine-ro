@@ -52,6 +52,7 @@ Qualquer coisa que precise escrever em runtime vai para `/run`, `/dev/shm` ou um
 - **Ventoy**: o hook dele para Alpine copia o `modloop` inteiro (~300 MB no 3.24) para a RAM antes do init ("Mounting boot media, please wait ......", do Ventoy); em QEMU, BIOS e UEFI bootam (Ventoy 1.1.18, ISO em FAT32). `INIT NOT FOUND` (o initramfs do Alpine nao chegou) foi relatado em bare metal e nao reproduziu.
 - O menu do ISO oficial espera 1 s; o `dup-entry.awk` sobe para 10 s (GRUB `timeout=10`, syslinux `TIMEOUT 100`).
 - Overlay do live: precisa de `etc/.default_boot_services`, senão o live perde os serviços padrão.
+- **Botao de energia**: o `setup-disk` nao ativa o `acpid` (o live ativa); sem ele o botao nao faz nada. O `install-ro` poe `acpid:default` (`/etc/acpi/PWRF/00000080` = `poweroff`).
 - Interfaces: `net.ifnames=0` no cmdline do sistema instalado (eudev renomearia `eth0`).
 - `console=ttyS0,115200 console=tty0`: `tty0` por último para as mensagens irem ao monitor em bare metal.
 

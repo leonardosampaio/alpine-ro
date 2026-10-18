@@ -190,7 +190,7 @@ F
 
 step "[5/6] servicos e bootloader (BIOS + UEFI, cmdline com ro)"
 for s in udev:sysinit udev-trigger:sysinit udev-settle:sysinit udev-postmount:default \
-	rodocker:boot networking:boot docker:default sshd:default crond:default local:default; do
+	rodocker:boot networking:boot docker:default sshd:default crond:default acpid:default local:default; do
 	c rc-update add ${s%%:*} ${s#*:}
 done
 c rc-update del mdev sysinit 2>/dev/null || true
