@@ -24,7 +24,7 @@ Qualquer coisa que precise escrever em runtime vai para `/run`, `/dev/shm` ou um
 - `iso-src/payload/install-ro.sh`: instalador. Particiona, roda `setup-disk`, instala pacotes, grava configs e instala GRUB i386-pc + x86_64-efi. `DRYRUN=1` para depois de escolher o disco e testar rede/repositorio.
 - `iso-src/payload/rodiag`: relatorio da maquina no live (firmware, DMI, CPU, RAM, video/driver, PCI, discos, `DRYRUN=1 install-ro`, rede, `dmesg`) em `/tmp/rodiag.txt`; roda sozinho com `rodiag` no cmdline (`local.d/rodiag.start`).
 - Menu do ISO (`dup-entry.awk`): `Linux lts`, `roinstall` (autoinstall), `rosafe` (autoinstall + `nomodeset`), `rodiag` (`nomodeset ignore_loglevel earlyprintk=efi|vga,keep initcall_debug`); sem `quiet` e com `initramfs_async=0` em todas; GRUB com `gfxpayload=keep`.
-- `iso-src/payload/roctl`: toda a logica de runtime (`boot`, `stop`, `seed`, `layers`, `rw`, `store`, `zfs-init`, `snap`, `check`). `check` tem 17 itens com pool; sem pool, 12 + `SKIP ZFS`.
+- `iso-src/payload/roctl`: toda a logica de runtime (`boot`, `stop`, `seed`, `layers`, `rw`, `store`, `zfs-init`, `snap`, `check`). `check` tem 18 itens com pool; sem pool, 13 + `SKIP ZFS`.
 - `iso-src/payload/rodocker`: servico OpenRC (runlevel boot), wrapper do `roctl boot/stop`.
 - `iso-src/payload/rodockerd`: `DOCKERD_BINARY`; roda `roctl layers` e faz `exec dockerd`.
 - Cron (`/etc/crontabs/root`): `roctl snap` todo dia 0h (snapshot recursivo `tank@auto-*`, mantem `SNAP_KEEP`=30) e `zpool scrub` mensal.
@@ -86,14 +86,14 @@ Escrever em `/`: `roctl rw on` (remonta `/` e `/boot/efi` rw) e depois `roctl rw
 Ambiente esperado: WSL2 com Docker e `/dev/kvm` (QEMU, OVMF, socat; `tesseract` e ImageMagick ajudam a ler a tela pelo `screendump`). Fluxo:
 
 ```sh
-./build.sh 3.24.2                                          # gera out/alpine-ro-3.24.2-x86_64.iso
-./vm-test.sh uefi out/alpine-ro-3.24.2-x86_64.iso &        # escolher "instalar automaticamente" no GRUB
+./build.sh 3.24.4                                          # gera out/alpine-ro-3.24.4-x86_64.iso
+./vm-test.sh uefi out/alpine-ro-3.24.4-x86_64.iso &        # escolher "instalar automaticamente" no GRUB
 tail -f ~/vms/alpine-ro-uefi/serial.log                    # espera "INSTALL_OK"; a VM desliga sozinha
 ./vm-test.sh uefi &                                        # 1o boot do sistema instalado (cria o pool)
 ssh -p 2222 root@127.0.0.1 roctl check                     # chave ~/.ssh/id_rsa.pub do host (fw_cfg); senha e negada
 ```
 
-- Selecionar a entrada automatica sem interacao: UEFI (GRUB) `sendkey end` e `sendkey ret` dentro dos 10 s (a entrada automatica e a ultima; `tesseract` no `screendump` detecta o menu); BIOS (syslinux sem `menu.c32`, so o prompt `boot:`) digitar `roinstall` + `ret`. O ISOLINUX nao limpa a tela: detectar o banner, nao tela vazia.
+- Selecionar a entrada automatica sem interacao: UEFI (GRUB) `sendkey home`, `sendkey down` e `sendkey ret` dentro dos 10 s (a automatica e a 2a; a ultima e o `rodiag`; `tesseract` no `screendump` detecta o menu); BIOS (syslinux sem `menu.c32`, so o prompt `boot:`) digitar `roinstall` + `ret`. O ISOLINUX nao limpa a tela: detectar o banner, nao tela vazia.
 - SSH no teste: o `vm-test.sh` passa `~/.ssh/id_rsa.pub` (ou `SSH_PUBKEY=`) por `-fw_cfg name=opt/alpine-ro/authorized_keys`; o `install-ro` le em `/sys/firmware/qemu_fw_cfg/by_name/...` (modulo `qemu_fw_cfg`) e grava no `authorized_keys`. So vale na instalacao (VM ja instalada antes disso: console, `sendkey` ~50 ms por tecla). Root por senha e negado (`prohibit-password`). Nao embutir chave de teste no ISO (`out/` pode ir para producao).
 - Sessao sem o grupo `kvm` (usermod sem relogin): `sg kvm -c ./vm-test.sh ...`. Sem `vmx`/`svm` no `/proc/cpuinfo` o KVM falha mesmo com `/dev/kvm`: `TCG=1` (instalacao ~15 min em vez de ~3).
 - Cenario principal (UEFI, discos iguais): ZFS mirror em `/mnt/zfs`, Samba ativo, `roctl check` todo PASS.
@@ -112,6 +112,7 @@ Tudo abaixo validado em QEMU no WSL2 em 2026-10-17, com TCG (o WSL nao expunha `
 - **Falhas**: disco do mirror arrancado com escrita continua (DEGRADED, tudo segue, `check` acusa); reboot degradado; troca a quente + resilver; `quit` com escrita no pool e no meio de `docker pull` em `store on` (p4: `recovering journal` -> clean, camadas reaproveitadas); `/dev/shm` 100% (so `docker run` novo falha); reboot com `rw on` / `store on` esquecidos volta a ro.
 - Em TCG o boot com muitas camadas leva >1 min ate o `roapp up` terminar: esperar antes do `check`.
 - **Bare metal validado (2026-10-18)**: placa TGT H61 (LGA1155, UEFI Aptio de 2011, sem Legacy/CSM), SSD de ~112 GB. Antes: em UEFI o live travava logo apos `PM: genpd: Disabling unused power domains` (espera do initramfs) e pelo Ventoy dava `INIT NOT FOUND`; com `initramfs_async=0` bootou. Instalacao ok (p3 20 GiB, p4 91 GiB), 1o boot ok (DHCP), `check` 12 PASS + `SKIP ZFS` (um disco so). O sistema instalado bootou mesmo sem `initramfs_async=0` (initramfs dele e menor); o parametro foi mantido por seguranca.
+- **Mitigacao do OpenSSH (2026-11-05)**, ISO 3.24.4, UEFI em TCG: pergunta respondida com `s` pelo teclado (tty1), `openssh` 10.3_p1-r2, `sshd -T` com `passwordauthentication no`, login por senha recusado (`Permission denied (publickey)`), `check` 18/18 com pool. Nao testado em VM: o caminho padrao (sem resposta, senha mantida).
 - **Pendente:** ZFS + Samba em bare metal (precisa de 2 discos vazios do mesmo tamanho); Ventoy em bare metal com o ISO atual.
 - Ideias em aberto: instalacao offline (pacotes embutidos no ISO); "Versoes anteriores" do Samba com os snapshots (`vfs_shadow_copy2`).
 
@@ -120,4 +121,4 @@ Tudo abaixo validado em QEMU no WSL2 em 2026-10-17, com TCG (o WSL nao expunha `
 - Nao embutir chave de teste no ISO: nas VMs, o `vm-test.sh` passa a chave do usuario por fw_cfg. Nunca versionar chave privada.
 - `iso-src/payload/authorized_keys` é embutido no ISO: em produção, usar a chave do próprio usuário ou remover o arquivo.
 - Senhas padrão (`alpine`) só para teste; documentar `ROOTPW` e `SMBPW`.
-- Root no SSH so por chave (`prohibit-password`, padrao do OpenSSH): a senha so vale no console. Nao liberar `PermitRootLogin yes` de forma permanente; o README ensina a liberar so para o `ssh-copy-id`.
+- SSH por senha: o `install-ro` pergunta (10 s, le `tty1` e `ttyS0`; padrao **manter**) ou usa `SSHPW=0|1`; grava `PasswordAuthentication yes|no` (+ `KbdInteractiveAuthentication no` quando desativa) em `/etc/ssh/sshd_config.d/50-alpine-ro.conf`, confere com `sshd -T` e aborta se nao bater; o `roctl check` compara o `sshd -T` com esse arquivo. Bypass de senha do OpenSSH no Alpine (aviso de 2026-11-05: `crypt()` do musl devolve `*` para chave longa e casa com contas `*`; corrigido no 3.24 em `openssh` 10.3_p1-r2 / ISO 3.24.4): o `install-ro` roda `apk upgrade` no alvo. Root sempre `prohibit-password`; nao liberar `PermitRootLogin yes` de forma permanente (o README ensina a liberar so para o `ssh-copy-id`, com `00-senha-temporaria.conf`, que vem antes do `50-`).

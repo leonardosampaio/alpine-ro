@@ -200,6 +200,8 @@ check() {
 	t "escrita em / falha"     "! touch /.rotest"
 	t "escrita na p3 falha"    "! touch $SRC/.rotest"
 	t "syslog em /dev/shm/log" "test -s /dev/shm/log/messages"
+	pw=$(sed -n 's/^PasswordAuthentication //p' /etc/ssh/sshd_config.d/50-alpine-ro.conf 2>/dev/null)
+	t "SSH senha = ${pw:-?} (instalacao)" "/usr/sbin/sshd -T | grep -qx 'passwordauthentication $pw'"
 	t "docker.log em /dev/shm" "test -e /dev/shm/log/docker.log"
 	t "docker em $DST overlay2" "docker info -f '{{.DockerRootDir}} {{.Driver}}' | grep -qx '$DST overlay2'"
 	t "logs do sistema <= 100 MiB" "df -k /dev/shm/log | awk 'NR==2{exit !(\$1==\"syslogs\" && \$2<=$SYSLOG_KB)}' && grep -q -- '-s 20480 -b 3' /etc/conf.d/syslog"

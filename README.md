@@ -42,7 +42,7 @@ Requisitos: Linux ou WSL2 com Docker, e internet.
 
 ```sh
 ./build.sh            # ultima versao estavel do Alpine
-./build.sh 3.24.2     # versao especifica
+./build.sh 3.24.4     # versao especifica
 ```
 
 Saida: `out/alpine-ro-<versao>-x86_64.iso` e o `.sha256` correspondente, em cerca de 1 minuto apos o download.
@@ -75,17 +75,32 @@ O **diagnóstico** (`rodiag`, também à mão no live) mostra firmware, placa, C
 
 Disco de boot: o **menor disco interno ≥ 32 GiB** (nunca USB nem o próprio pendrive). Para escolher, use `rodisk=/dev/sdX` no cmdline do boot ou `DISK=/dev/sdX install-ro`.
 
-Senhas padrão: root `alpine`, Samba (usuário `smb`) `alpine`. Para trocar, use `ROOTPW=... SMBPW=... install-ro`. A senha do root vale **só no console**: no SSH o root entra **só por chave** (`PermitRootLogin prohibit-password`, padrão do OpenSSH).
+Senhas padrão: root `alpine`, Samba (usuário `smb`) `alpine`. Para trocar, use `ROOTPW=... SMBPW=... install-ro`. A senha do root vale **só no console** (no SSH o root entra só por chave, `PermitRootLogin prohibit-password`).
 
-Para ter SSH desde o 1º boot, ponha sua chave em `iso-src/payload/authorized_keys` antes do build. Num sistema já instalado sem chave, libere a senha só por um instante:
+**SSH por senha**: no início, a instalação pergunta se deve desativá-lo e espera **10 s**. Responda `s` (no monitor ou na serial) para aceitar só chave; sem resposta ou com `n`, a senha continua aceita para os outros usuários. Sem pergunta: `SSHPW=0 install-ro` desativa, `SSHPW=1` mantém. A escolha fica em `/etc/ssh/sshd_config.d/50-alpine-ro.conf`, e o `roctl check` confere se o `sshd` está de acordo. A instalação roda `apk upgrade`, então o `openssh` já vem corrigido do [bypass de senha do OpenSSH no Alpine](https://alpinelinux.org/posts/2026-11-05-openssh-password-authentication-bypass/). Desativar a senha protege mesmo se um `openssh` antigo voltar.
+
+Para ter SSH desde o 1º boot, ponha sua chave em `iso-src/payload/authorized_keys` antes do build. Num sistema já instalado sem chave, libere a senha só por um instante (o arquivo `00-*` vem antes do `50-*`, e no `sshd` vale a primeira definição):
 
 ```sh
 # no console da maquina
-roctl rw on && echo "PermitRootLogin yes" >> /etc/ssh/sshd_config && rc-service sshd restart
+roctl rw on && printf 'PasswordAuthentication yes\nPermitRootLogin yes\n' > /etc/ssh/sshd_config.d/00-senha-temporaria.conf && rc-service sshd restart
 # no seu PC
 ssh-copy-id root@IP-DO-SERVIDOR
-ssh root@IP-DO-SERVIDOR 'sed -i "/^PermitRootLogin yes$/d" /etc/ssh/sshd_config && rc-service sshd restart && roctl rw off'
+ssh root@IP-DO-SERVIDOR 'rm /etc/ssh/sshd_config.d/00-senha-temporaria.conf && rc-service sshd restart && roctl rw off'
 ```
+
+**Sistemas instalados antes de 2026-11-05** podem ter o `openssh` vulnerável. No console (ou por SSH com chave), atualize e, se quiser só chave, desative a senha:
+
+```sh
+roctl rw on
+apk upgrade -U -a                     # openssh >= 10.3_p1-r2 no 3.24
+printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\n' > /etc/ssh/sshd_config.d/50-alpine-ro.conf
+sshd -T | grep -i '^passwordauthentication'   # deve mostrar "no"
+rc-service sshd restart               # o upgrade sozinho nao troca o sshd em execucao
+roctl rw off
+```
+
+Teste o login por chave numa segunda sessão antes de fechar a atual. Para ver se alguém entrou por senha: `grep 'Accepted password' /var/log/messages*` (os logs ficam em RAM e somem no reboot).
 
 Outras variáveis do `install-ro`: `TZ` (fuso, padrão `America/Sao_Paulo`; define a hora do snapshot diário) e `SNAP_KEEP` (snapshots mantidos, padrão 30). Ex.: `TZ=Europe/Lisbon SNAP_KEEP=14 install-ro`.
 
@@ -278,9 +293,9 @@ sudo usermod -aG kvm $USER     # e reabra o terminal; /dev/kvm precisa existir
 No Windows, `%UserProfile%\.wslconfig` com `[wsl2]`, `nestedVirtualization=true` e `memory=16GB`, seguido de `wsl --shutdown`. Se o `/proc/cpuinfo` do WSL nao mostrar `vmx`/`svm`, o KVM nao funciona: `TCG=1 ./vm-test.sh ...` emula (bem mais lento).
 
 ```sh
-./vm-test.sh uefi out/alpine-ro-3.24.2-x86_64.iso   # instala (menu: "instalar automaticamente")
+./vm-test.sh uefi out/alpine-ro-3.24.4-x86_64.iso   # instala (menu: "instalar automaticamente")
 ./vm-test.sh uefi                                     # depois: boota do disco
-./vm-test.sh bios out/alpine-ro-3.24.2-x86_64.iso   # cenario BIOS legado (VM separada; no "boot:" digite roinstall)
+./vm-test.sh bios out/alpine-ro-3.24.4-x86_64.iso   # cenario BIOS legado (VM separada; no "boot:" digite roinstall)
 Z2_SIZE=5T ./vm-test.sh uefi out/...iso               # discos diferentes: nao deve criar ZFS
 ./vm-del.sh uefi        # desliga e apaga a VM (uefi|bios|all, -y sem perguntar)
 ```

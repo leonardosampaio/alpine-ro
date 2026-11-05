@@ -2,6 +2,7 @@
 # install-ro: instala Alpine com /, /boot/efi e p4 sempre em ro; Docker em /dev/shm; volumes em ZFS
 # (o pool ZFS mirror e criado no 1o boot so se houver 2 discos livres de mesmo tamanho), montado
 # em /mnt/zfs (RAID1 por software); Samba em \\<host>\zfs = /mnt/zfs/samba. Apps: roapp (/etc/roapps). Funciona em BIOS e UEFI. Senhas: ROOTPW, SMBPW (padrao: alpine).
+# SSHPW=0 desativa o SSH por senha, SSHPW=1 mantem (sem a variavel, pergunta por 10 s; padrao: manter).
 # TZ (padrao America/Sao_Paulo; vale para o snapshot diario das 0h), SNAP_KEEP (snapshots mantidos, padrao 30).
 # Disco de boot: rodisk=/dev/X no cmdline do kernel, variavel DISK, ou o MENOR disco interno (>= 32 GiB).
 # DRYRUN=1: so escolhe o disco e testa rede/repositorio, sem gravar nada (usado pelo rodiag).
@@ -49,6 +50,25 @@ if [ -n "$DRYRUN" ]; then   # rodiag: so mostra o que faria; nada e particionado
 	wget -q --spider $M/v$V/main/x86_64/APKINDEX.tar.gz && echo "repositorio $M: ok" || echo "repositorio $M: INACESSIVEL"
 	trap - EXIT; echo "DRYRUN: $DISK seria APAGADO; nada foi gravado"; exit 0
 fi
+# SSH por senha: SSHPW=0 desativa, SSHPW=1 mantem; sem a variavel, pergunta (10 s, padrao: manter).
+# No autoinstall a entrada padrao nao e terminal: le de tty1 e ttyS0 ao mesmo tempo, vale a 1a resposta.
+if [ -z "$SSHPW" ]; then
+	echo; echo ">>> Desativar o login SSH por senha (so chave)? [s/N] (10 s, padrao: nao)"
+	A=/tmp/.sshpw.$$; rm -f $A
+	if [ -t 0 ]; then read -t 10 a && echo "$a" > $A || true
+	else
+		pids=
+		for t in /dev/tty1 /dev/ttyS0; do
+			[ -c $t ] || continue
+			( read -t 10 a < $t 2>/dev/null && [ ! -s $A ] && echo "${a:-n}" > $A ) & pids="$pids $!"
+		done
+		i=0; while [ $i -lt 10 ] && [ ! -s $A ]; do sleep 1; i=$((i+1)); done
+		kill $pids 2>/dev/null || true
+	fi
+	case $(cat $A 2>/dev/null) in [sSyY]*) SSHPW=0 ;; *) SSHPW=1 ;; esac
+	rm -f $A
+fi
+[ "$SSHPW" = 0 ] && echo "SSH: so chave (senha desativada)" || echo "SSH: senha permitida (root continua so por chave)"
 printf '%s/v%s/main\n%s/v%s/community\n' $M $V $M $V > /etc/apk/repositories
 apk update && apk add sfdisk e2fsprogs dosfstools
 for m in $T/dev $T/proc $T/sys $T/boot/efi $T; do umount $m 2>/dev/null || true; done
@@ -72,6 +92,16 @@ apk --root $T add docker docker-openrc zfs zfs-lts openssh grub-efi grub-bios ef
 	samba samba-server-openrc docker-cli-compose tzdata
 c() { chroot $T "$@"; }
 c ssh-keygen -A; c zgenhostid -f; echo "root:${ROOTPW:-alpine}" | c chpasswd
+# openssh corrigido (aviso Alpine 2026-11-05: bypass de senha via crypt() do musl; 3.24: >= 10.3_p1-r2)
+apk --root $T upgrade -U
+# SSHPW=0: so chave (o bypass de senha deixa de se aplicar mesmo com openssh antigo). O root e sempre prohibit-password.
+[ "$SSHPW" = 0 ] && PW=no || PW=yes
+mkdir -p $T/etc/ssh/sshd_config.d
+{ echo "PasswordAuthentication $PW"; [ $PW = no ] && echo 'KbdInteractiveAuthentication no'; } > $T/etc/ssh/sshd_config.d/50-alpine-ro.conf
+c /usr/sbin/sshd -T 2>/dev/null | grep -qx "passwordauthentication $PW" || {
+	sed -i "s/^#\?PasswordAuthentication .*/PasswordAuthentication $PW/" $T/etc/ssh/sshd_config
+	grep -q "^PasswordAuthentication $PW" $T/etc/ssh/sshd_config || echo "PasswordAuthentication $PW" >> $T/etc/ssh/sshd_config; }
+c /usr/sbin/sshd -T 2>/dev/null | grep -qx "passwordauthentication $PW" || { echo "ERRO: sshd nao ficou com PasswordAuthentication $PW"; exit 1; }
 
 step "[3/6] fstab ro, rede e caminhos gravaveis em /run e /dev/shm"
 mkdir -p $T/mnt/docker-store $T/mnt/zfs $T/var/lib/samba $T/usr/local/sbin $T/etc/docker $T/etc/udhcpc $T/root/.ssh $T/etc/roapps
