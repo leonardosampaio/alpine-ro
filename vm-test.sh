@@ -1,7 +1,7 @@
 #!/bin/sh
 # Sobe uma VM de teste do Alpine RO com QEMU/KVM (WSL2 ou Linux).
 # uso: ./vm-test.sh [uefi|bios] [iso]       sem iso: boota do disco ja instalado
-# env: SSH_PUBKEY=~/.ssh/id_rsa.pub TCG=1 (sem KVM) MEM=8G CPUS=2 BOOT_SIZE=128G Z1_SIZE=6T Z2_SIZE=6T VMS=~/vms
+# env: SSH_PUBKEY=~/.ssh/id_rsa.pub TCG=1 (sem KVM) VNC_PORT=5910 MEM=8G CPUS=2 BOOT_SIZE=128G Z1_SIZE=6T Z2_SIZE=6T VMS=~/vms
 #      (Z2_SIZE diferente de Z1_SIZE testa o cenario "sem ZFS")
 # Portas no host (127.0.0.1; no WSL2 tambem em localhost no Windows): ssh 2222, samba 4450, portainer 9443,
 # netdata 19999 e EXTRA_PORTS="P1 P2" (mesma porta na VM). Com a VM ligada: echo "hostfwd_add n tcp:127.0.0.1:P-:P" | socat - UNIX:monitor.sock
@@ -38,7 +38,9 @@ if [ -f "$KEY" ]; then FWCFG="-fw_cfg name=opt/alpine-ro/authorized_keys,file=$K
 else echo "aviso: $KEY nao existe; a VM so aceita a chave embutida no ISO (ou o console)"; fi
 FWD=; for p in $EXTRA_PORTS; do FWD="$FWD,hostfwd=tcp:127.0.0.1:$p-:$p"; done
 if [ -n "$DISPLAY$WAYLAND_DISPLAY" ] && qemu-system-x86_64 -display help 2>/dev/null | grep -qx gtk; then DISP="-display gtk"
-else DISP="-display none -vnc 127.0.0.1:0"; echo "sem WSLg ou QEMU sem gtk: use um cliente VNC em 127.0.0.1:5900"; fi
+# VNC fora da 5900: no Windows um VNC server (ex.: TightVNC) costuma ocupa-la e recusar loopback
+else VNC_PORT=${VNC_PORT:-5910}; DISP="-display none -vnc 127.0.0.1:$((VNC_PORT - 5900))"
+	echo "sem WSLg ou QEMU sem gtk: use um cliente VNC em 127.0.0.1:$VNC_PORT"; fi
 
 echo "VM $MODE: ${MEM:-8G} RAM, ${CPUS:-2} vCPU, discos em $D"
 echo "serial: tail -f $D/serial.log | ssh: ssh -p 2222 root@127.0.0.1 | monitor: socat - UNIX:$D/monitor.sock"

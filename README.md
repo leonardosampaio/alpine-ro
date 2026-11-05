@@ -308,7 +308,7 @@ Z2_SIZE=5T ./vm-test.sh uefi out/...iso               # discos diferentes: nao d
 | Portas no host | ssh 2222, samba 4450, portainer 9443, netdata 19999 e `EXTRA_PORTS="P1 P2"` (em `127.0.0.1`; no WSL2 também em `localhost` no Windows) |
 | Chave SSH | `~/.ssh/id_rsa.pub` do usuário vai para o `authorized_keys` da VM na instalação (`SSH_PUBKEY` para outra; `ssh -p 2222 root@127.0.0.1`) |
 
-- Tela: janela via WSLg; sem WSLg, VNC em `127.0.0.1:5900`. Serial: `tail -f ~/vms/alpine-ro-uefi/serial.log`.
+- Tela: janela via WSLg; sem WSLg, VNC em `127.0.0.1:5910` (`VNC_PORT=`; a 5900 costuma estar ocupada por um VNC server no Windows). Serial: `tail -f ~/vms/alpine-ro-uefi/serial.log`.
 - Monitor do QEMU: `socat - UNIX:$HOME/vms/alpine-ro-uefi/monitor.sock`
   - `device_del dz2`: arranca um disco ZFS com a VM ligada (teste de mirror DEGRADED);
   - `quit`: queda de energia.
